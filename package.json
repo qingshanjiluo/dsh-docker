@@ -1,0 +1,26 @@
+{
+  "name": "dsh-docker",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness Docker 容器管理 — 构建、运行、日志、Compose、网络、数据卷",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "scripts": { "build": "tsdown", "dev": "tsdown --watch", "typecheck": "tsc --noEmit" },
+  "keywords": ["deepseek-harness", "dsh-plugin", "docker", "container", "compose"],
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*", "@deepseek-ai/dsh-tools": "*",
+    "@deepseek-ai/dsh-client-runtime": "*", "@deepseek-ai/dsh-client-locale": "*",
+    "@deepseek-ai/dsh-client-ui-settings": "*"
+  },
+  "devDependencies": { "typescript": "^5.5.0", "tsdown": "^0.11.0" },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": { "platform": "web", "inject": ["@deepseek-ai/dsh-client-runtime", "@deepseek-ai/dsh-client-locale", "@deepseek-ai/dsh-client-ui-settings"] }
+  }
+}

@@ -1,0 +1,5 @@
+- insert:
+    - id: docker
+      name: dsh-docker
+      config:
+        enabled: true
