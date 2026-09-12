@@ -1,515 +1,723 @@
 /**
- * dsh-docker — DeepSeek Harness Docker 容器管理
+ * Docker inspection tools for DeepSeek Harness.
  *
- * 功能：
- * 1. 容器管理：列出、运行、停止、重启、删除、查看日志
- * 2. 镜像管理：构建、列出、删除、拉取
- * 3. 网络管理：列出、创建、删除
- * 4. 数据卷管理：列出、创建、删除
- * 5. Docker Compose：up/down/ps/logs
- * 6. 系统信息：docker info, docker version
+ * `docker_ps` lists containers, `docker_logs` tails one container's logs, and
+ * `docker_compose_config` validates a Compose file. Each tool builds its own
+ * `docker` argv and runs it through {@link Config.runCommand}, an injectable
+ * seam that defaults to `spawnSync` from `node:child_process`. Because the seam
+ * is configuration, unit tests — and hosts without a reachable daemon — inject a
+ * fake runner: no network, no real subprocess, no live engine is required.
+ * @module @qingshanjiluo/dsh-docker
  */
 
-import { execSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
-import { z } from 'zod';
+import { spawnSync } from 'node:child_process'
+import type { Context } from '@deepseek-ai/cordis'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import z from '@deepseek-ai/schemastery'
 
-export const name = 'dsh-docker';
-export const inject = ['settings', 'tools', 'commands'];
+export const name = 'dsh-docker'
+export const inject = ['tools']
 
-const configSchema = z.object({
-  enabled: z.boolean().default(true),
-  dockerPath: z.string().default('docker'),
-  composePath: z.string().default('docker-compose'),
-  defaultTimeout: z.number().int().min(1000).max(300000).default(30000),
-});
+// ---------------------------------------------------------------------------
+// Command seam
+// ---------------------------------------------------------------------------
 
-type Config = z.infer<typeof configSchema>;
+/** One finished command: exit status plus the captured output streams. */
+export interface CommandResult {
+  readonly exitCode: number
+  readonly stdout: string
+  readonly stderr: string
+}
 
-// ==================== Docker 执行器 ====================
+/**
+ * How this plugin executes one docker invocation. `argv[0]` is the executable
+ * and the rest are literal arguments — never a shell string — so argument
+ * quoting is not an attack surface. Implementations may be sync or async.
+ */
+export type RunCommand = (argv: readonly string[], timeoutMs: number) => CommandResult | Promise<CommandResult>
 
-function dockerExec(args: string, options?: { cwd?: string; timeout?: number }): string {
-  const cmd = `${options?.cwd ? '' : ''}docker ${args}`;
-  try {
-    return execSync(cmd, {
-      cwd: options?.cwd,
-      timeout: options?.timeout || 30000,
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    }).trim();
-  } catch (err: any) {
-    const stderr = (err.stderr || '').trim();
-    const stdout = (err.stdout || '').trim();
-    throw new Error(stderr || stdout || `Docker 命令失败: ${cmd}`);
+/** The production seam: `spawnSync` with no shell, a hard timeout, and a cap. */
+export function defaultRunCommand(argv: readonly string[], timeoutMs: number): CommandResult {
+  const [file, ...args] = argv
+  if (!file) return { exitCode: -1, stdout: '', stderr: 'nothing to run: the command was empty' }
+  const result = spawnSync(file, args, {
+    encoding: 'utf8',
+    timeout: timeoutMs,
+    windowsHide: true,
+    maxBuffer: 16 * 1024 * 1024,
+  })
+  if (result.error) return { exitCode: -1, stdout: '', stderr: `${file}: ${result.error.message}` }
+  if (result.status === null || result.status === undefined) {
+    return {
+      exitCode: 124,
+      stdout: result.stdout ?? '',
+      stderr: `${file} was killed (${result.signal ?? 'unknown signal'}) after ${timeoutMs}ms`,
+    }
   }
+  return { exitCode: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' }
 }
 
-function dockerExecJson<T = any>(args: string, options?: { cwd?: string; timeout?: number }): T {
-  const output = dockerExec(args + ' --format \'{{json .}}\'', options);
-  const lines = output.split('\n').filter(Boolean);
-  return lines.map(line => JSON.parse(line)) as T;
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+/** Deployment policy for the Docker tools. */
+export interface Config {
+  /** Executable the tools invoke: `docker`, `podman`, or an absolute path. */
+  dockerPath: string
+  /** Per-command timeout in milliseconds handed to {@link RunCommand}. */
+  timeoutMs: number
+  /** Hard cap on the log lines `docker_logs` may return, however large `tail` is. */
+  maxLogLines: number
+  /**
+   * Injection point for the process runner. Defaults to
+   * {@link defaultRunCommand}; override it in tests or on daemon-less hosts.
+   */
+  runCommand: RunCommand
 }
 
-// ==================== 容器管理 ====================
+/** Schemastery configuration for the Docker tools. */
+export const Config: z<Config> = z.object({
+  dockerPath: z.string().default('docker'),
+  timeoutMs: z.number().default(15000),
+  maxLogLines: z.number().default(400),
+  runCommand: z.function().default(defaultRunCommand),
+})
 
-function listContainers(all: boolean = true): any[] {
-  const args = `ps ${all ? '-a' : ''} --format \'{"id":"{{.ID}}","name":"{{.Names}}","image":"{{.Image}}","status":"{{.Status}}","ports":"{{.Ports}}","created":"{{.CreatedAt}}","size":"{{.Size}}"}\'`;
-  const output = dockerExec(args);
-  if (!output) return [];
-  return output.split('\n').filter(Boolean).map(line => {
-    try { return JSON.parse(line); } catch { return null; }
-  }).filter(Boolean);
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+/** Render an argv as a copy-pasteable command line for the model. */
+function formatArgv(argv: readonly string[]): string {
+  return argv.map((token) => (/^[\w@%+=:,./-]+$/.test(token) ? token : `'${token.replace(/'/g, `'\\''`)}'`)).join(' ')
 }
 
-function runContainer(image: string, options: {
-  name?: string; detach?: boolean; ports?: string[]; volumes?: string[];
-  env?: string[]; network?: string; command?: string;
-} = {}): string {
-  const args = ['run'];
-  if (options.detach) args.push('-d');
-  if (options.name) args.push(`--name ${options.name}`);
-  if (options.ports) options.ports.forEach(p => args.push(`-p ${p}`));
-  if (options.volumes) options.volumes.forEach(v => args.push(`-v ${v}`));
-  if (options.env) options.env.forEach(e => args.push(`-e ${e}`));
-  if (options.network) args.push(`--network ${options.network}`);
-  args.push(image);
-  if (options.command) args.push(options.command);
-  return dockerExec(args.join(' '));
+/** First non-blank line of a stream, trimmed and clipped — used for messages. */
+function firstLine(text: string, limit = 400): string {
+  const line = text.split(/\r?\n/).find((row) => row.trim() !== '')?.trim() ?? ''
+  return line.length > limit ? `${line.slice(0, limit)}…` : line
 }
 
-function stopContainer(id: string, timeout?: number): string {
-  return dockerExec(`stop${timeout ? ` -t ${timeout}` : ''} ${id}`);
+/** A single model-supplied token is safe to hand to docker verbatim. */
+function tokenProblem(value: string, label: string): string | undefined {
+  if (value.trim() === '') return `${label}: must not be empty`
+  if (/[\r\n\0]/.test(value)) return `${label}: must not contain newlines or NUL characters`
+  if (value.startsWith('-')) return `${label}: must not start with "-" (docker would read it as an option)`
+  if (/\s/.test(value)) return `${label}: must not contain whitespace`
+  return undefined
 }
 
-function removeContainer(id: string, force: boolean = false): string {
-  return dockerExec(`rm${force ? ' -f' : ''} ${id}`);
+/** A path may contain spaces but must stay on one line. */
+function pathProblem(value: string, label: string): string | undefined {
+  if (value.trim() === '') return `${label}: must not be empty`
+  if (/[\r\n\0]/.test(value)) return `${label}: must not contain newlines or NUL characters`
+  return undefined
 }
 
-function containerLogs(id: string, options: { tail?: number; since?: string; follow?: boolean } = {}): string {
-  const args = ['logs'];
-  if (options.tail) args.push(`--tail ${options.tail}`);
-  if (options.since) args.push(`--since ${options.since}`);
-  if (options.follow) args.push('-f');
-  args.push(id);
-  return dockerExec(args.join(' '), { timeout: options.follow ? 60000 : 10000 });
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function inspectContainer(id: string): any {
-  const output = dockerExec(`inspect ${id}`);
-  const parsed = JSON.parse(output);
-  return Array.isArray(parsed) ? parsed[0] : parsed;
+function scalarText(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  if (Array.isArray(value)) return value.map(scalarText).filter((text) => text !== '').join(',')
+  return ''
 }
 
-function execInContainer(id: string, command: string): string {
-  return dockerExec(`exec ${id} ${command}`);
+/** Read one docker JSON field, tolerating the key-case differences per version. */
+function field(row: Record<string, unknown>, key: string): string {
+  const direct = row[key]
+  if (direct !== undefined) return scalarText(direct)
+  const lower = key.toLowerCase()
+  for (const [name, value] of Object.entries(row)) {
+    if (name.toLowerCase() === lower) return scalarText(value)
+  }
+  return ''
 }
 
-function containerStats(id: string): any {
-  const output = dockerExec(`stats ${id} --no-stream --format \'{"cpu":"{{.CPUPerc}}","mem_usage":"{{.MemUsage}}","mem_perc":"{{.MemPerc}}","net_io":"{{.NetIO}}","block_io":"{{.BlockIO}}","pids":"{{.PIDs}}"}\'`);
-  try { return JSON.parse(output); } catch { return { raw: output }; }
+/**
+ * Parse `docker ps --format json`, which is one JSON object per line on current
+ * engines and a single JSON array on older ones.
+ * @param stdout - raw standard output of the command.
+ * @returns the decoded rows plus whether any of the text parsed.
+ */
+function parseJsonRows(stdout: string): { rows: Record<string, unknown>[]; parsed: boolean } {
+  const text = stdout.trim()
+  if (text === '') return { rows: [], parsed: true }
+  let whole: unknown
+  try {
+    whole = JSON.parse(text)
+  } catch {
+    whole = undefined
+  }
+  if (Array.isArray(whole)) return { rows: whole.filter(isRecord), parsed: true }
+  if (isRecord(whole)) return { rows: [whole], parsed: true }
+  const rows: Record<string, unknown>[] = []
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (trimmed === '') continue
+    try {
+      const value: unknown = JSON.parse(trimmed)
+      if (isRecord(value)) rows.push(value)
+    } catch {
+      // A warning the engine printed to stdout; skip the line.
+    }
+  }
+  return { rows, parsed: rows.length > 0 }
 }
 
-// ==================== 镜像管理 ====================
-
-function listImages(): any[] {
-  const output = dockerExec('images --format \'{"id":"{{.ID}}","repo":"{{.Repository}}","tag":"{{.Tag}}","size":"{{.Size}}","created":"{{.CreatedSince}}","created_at":"{{.CreatedAt}}"}\'');
-  if (!output) return [];
-  return output.split('\n').filter(Boolean).map(line => {
-    try { return JSON.parse(line); } catch { return null; }
-  }).filter(Boolean);
+/** Split command output into lines, dropping the trailing empty artifact. */
+function toLines(text: string): string[] {
+  const lines = text.split(/\r?\n/)
+  while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop()
+  return lines
 }
 
-function buildImage(context: string, options: { tag?: string; dockerfile?: string; buildArgs?: string[]; noCache?: boolean } = {}): string {
-  const args = ['build'];
-  if (options.tag) args.push(`-t ${options.tag}`);
-  if (options.dockerfile) args.push(`-f ${options.dockerfile}`);
-  if (options.buildArgs) options.buildArgs.forEach(a => args.push(`--build-arg ${a}`));
-  if (options.noCache) args.push('--no-cache');
-  args.push(context);
-  return dockerExec(args.join(' '), { timeout: 300000 });
+// ---------------------------------------------------------------------------
+// Compose file inspection (pure)
+// ---------------------------------------------------------------------------
+
+interface Row {
+  lineNo: number
+  indent: number
+  text: string
 }
 
-function pullImage(image: string): string {
-  return dockerExec(`pull ${image}`, { timeout: 120000 });
+interface CNode {
+  /** Mapping key; empty for a `-` sequence item. */
+  key: string
+  /** Inline scalar text (or the body of a sequence item). */
+  inline: string
+  lineNo: number
+  children: CNode[]
 }
 
-function removeImage(id: string, force: boolean = false): string {
-  return dockerExec(`rmi${force ? ' -f' : ''} ${id}`);
+/** Strip a whole-line or trailing `#` comment, ignoring `#` inside quotes. */
+function stripComment(text: string): string {
+  let quote = ''
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!
+    if (quote) {
+      if (ch === quote) quote = ''
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      continue
+    }
+    if (ch === '#' && (i === 0 || /\s/.test(text[i - 1]!))) return text.slice(0, i).trimEnd()
+  }
+  return text
 }
 
-function tagImage(source: string, target: string): string {
-  return dockerExec(`tag ${source} ${target}`);
-}
+/**
+ * Minimal indentation-based YAML reader for Compose documents: mappings,
+ * `-` sequences, and inline scalars. Flow collections and long-syntax entries
+ * are kept as text, which is all the structural rules below need.
+ * @param text - the compose document.
+ * @returns the root entries plus the syntax problems found while reading.
+ */
+function readCompose(text: string): { nodes: CNode[]; errors: string[] } {
+  const errors: string[] = []
+  const rows: Row[] = []
+  const raws = text.split(/\r?\n/)
+  for (let index = 0; index < raws.length; index++) {
+    const raw = raws[index]!
+    const lineNo = index + 1
+    if (raw.trim() === '') continue
+    const indent = raw.length - raw.trimStart().length
+    if (raw.slice(0, indent).includes('\t')) {
+      errors.push(`line ${lineNo}: YAML indentation must use spaces, not a tab`)
+      continue
+    }
+    const body = stripComment(raw.trim())
+    if (body === '' || body === '---') continue
+    rows.push({ lineNo, indent, text: body })
+  }
+  if (rows.length === 0) return { nodes: [], errors }
 
-// ==================== 网络管理 ====================
-
-function listNetworks(): any[] {
-  const output = dockerExec('network ls --format \'{"id":"{{.ID}}","name":"{{.Name}}","driver":"{{.Driver}}","scope":"{{.Scope}}","created":"{{.CreatedAt}}"}\'');
-  if (!output) return [];
-  return output.split('\n').filter(Boolean).map(line => {
-    try { return JSON.parse(line); } catch { return null; }
-  }).filter(Boolean);
-}
-
-function createNetwork(name: string, driver: string = 'bridge'): string {
-  return dockerExec(`network create --driver ${driver} ${name}`);
-}
-
-function removeNetwork(id: string): string {
-  return dockerExec(`network rm ${id}`);
-}
-
-// ==================== 数据卷管理 ====================
-
-function listVolumes(): any[] {
-  const output = dockerExec('volume ls --format \'{"name":"{{.Name}}","driver":"{{.Driver}}","mountpoint":"{{.Mountpoint}}"}\'');
-  if (!output) return [];
-  return output.split('\n').filter(Boolean).map(line => {
-    try { return JSON.parse(line); } catch { return null; }
-  }).filter(Boolean);
-}
-
-function createVolume(name: string, driver: string = 'local'): string {
-  return dockerExec(`volume create --driver ${driver} ${name}`);
-}
-
-function removeVolume(id: string, force: boolean = false): string {
-  return dockerExec(`volume rm${force ? ' -f' : ''} ${id}`);
-}
-
-// ==================== Compose ====================
-
-function composeUp(cwd: string, options: { detach?: boolean; build?: boolean; services?: string[] } = {}): string {
-  const args = ['-f', `${cwd}/docker-compose.yml`, 'up'];
-  if (options.detach) args.push('-d');
-  if (options.build) args.push('--build');
-  if (options.services) args.push(...options.services);
-  return dockerExec(`compose ${args.join(' ')}`, { cwd, timeout: 300000 });
-}
-
-function composeDown(cwd: string, options: { volumes?: boolean } = {}): string {
-  const args = ['-f', `${cwd}/docker-compose.yml`, 'down'];
-  if (options.volumes) args.push('-v');
-  return dockerExec(`compose ${args.join(' ')}`, { cwd });
-}
-
-function composePs(cwd: string): any[] {
-  const output = dockerExec('compose ps --format \'{"name":"{{.Name}}","command":"{{.Command}}","status":"{{.Status}}","ports":"{{.Ports}}","image":"{{.Image}}"}\'', { cwd });
-  if (!output) return [];
-  return output.split('\n').filter(Boolean).map(line => {
-    try { return JSON.parse(line); } catch { return null; }
-  }).filter(Boolean);
-}
-
-function composeLogs(cwd: string, options: { tail?: number; service?: string } = {}): string {
-  const args = ['compose'];
-  if (options.tail) args.push(`--tail ${options.tail || 100}`);
-  args.push('logs');
-  if (options.service) args.push(options.service);
-  return dockerExec(args.join(' '), { cwd, timeout: 10000 });
-}
-
-// ==================== 系统信息 ====================
-
-function dockerInfo(): any {
-  const output = dockerExec('info --format \'{"server_version":"{{.ServerVersion}}","os":"{{.OperatingSystem}}","kernel":"{{.KernelVersion}}","cpus":{{.NCPU}},"memory":"{{.MemTotal}}","containers_running":{{.ContainersRunning}},"containers_stopped":{{.ContainersStopped}},"images":{{.Images}},"docker_root":"{{.DockerRootDir}}","storage_driver":"{{.Driver}}"}\'');
-  try { return JSON.parse(output); } catch { return { raw: output }; }
-}
-
-function dockerVersion(): any {
-  const output = dockerExec('version --format \'{"client":"{{.Client.Version}}","server":"{{.Server.Version}}","api":"{{.Client.API version}}","go":"{{.Client.Go version}}","git":"{{.Client.GitCommit}}","built":"{{.Client.BuildTime}}"}\'');
-  try { return JSON.parse(output); } catch { return { raw: output }; }
-}
-
-function diskUsage(): string {
-  return dockerExec('system df');
-}
-
-// ==================== 插件入口 ====================
-
-export function apply(ctx: any, config: Config) {
-  if (!config.enabled) return;
-
-  // docker_ps — 列出容器
-  ctx.effect(() => ctx.tools.register({
-    name: 'docker_ps',
-    description: '列出 Docker 容器。返回容器 ID、名称、镜像、状态、端口等信息。',
-    parameters: {
-      all: { type: 'boolean', description: '是否显示所有容器（默认只显示运行中）' },
-      filter: { type: 'string', description: '过滤条件（如 status=running, name=web）' },
-    },
-    output: {
-      schema: { type: 'json' },
-      render(_args: unknown, value: unknown) {
-        const containers = value as any[];
-        if (containers.length === 0) return [{ type: 'text', text: '📭 没有容器' }];
-        const lines = [`## 🐳 Docker 容器 (${containers.length})`];
-        for (const c of containers) {
-          const status = c.status?.includes('Up') ? '🟢' : '🔴';
-          lines.push(`- ${status} **${c.name}** (${c.id?.substring(0, 12)})`);
-          lines.push(`  镜像: ${c.image} | 状态: ${c.status}`);
-          if (c.ports) lines.push(`  端口: ${c.ports}`);
+  const collect = (start: number, indent: number): CNode[] => {
+    const nodes: CNode[] = []
+    let i = start
+    while (i < rows.length) {
+      const row = rows[i]!
+      if (row.indent < indent) break
+      if (row.indent > indent) {
+        errors.push(`line ${row.lineNo}: unexpected indentation at "${row.text}"`)
+        i++
+        continue
+      }
+      i++
+      const isItem = row.text === '-' || row.text.startsWith('- ')
+      const body = isItem ? row.text.slice(1).trim() : row.text
+      let key = ''
+      let inline = body
+      if (!isItem) {
+        const sep = body.indexOf(':')
+        if (sep < 0 && !body.endsWith(':')) {
+          errors.push(`line ${row.lineNo}: expected "key: value", got "${row.text}"`)
+          continue
         }
-        return [{ type: 'text', text: lines.join('\n') }];
-      },
-    },
-    async execute(args: { all?: boolean; filter?: string }) {
-      return listContainers(args.all !== false);
-    },
-  }), 'dsh-docker: docker_ps');
-
-  // docker_run — 运行容器
-  ctx.effect(() => ctx.tools.register({
-    name: 'docker_run',
-    description: '运行 Docker 容器。支持指定名称、端口映射、环境变量、网络等。',
-    parameters: {
-      image: { type: 'string', description: '镜像名称（如 nginx:latest）' },
-      name: { type: 'string', description: '容器名称' },
-      detach: { type: 'boolean', description: '是否后台运行（默认 true）' },
-      ports: { type: 'string', description: '端口映射，逗号分隔（如 8080:80,3000:3000）' },
-      volumes: { type: 'string', description: '卷挂载，逗号分隔（如 /host/path:/container/path）' },
-      env: { type: 'string', description: '环境变量，逗号分隔（如 KEY1=val1,KEY2=val2）' },
-      network: { type: 'string', description: '网络名称' },
-      command: { type: 'string', description: '启动命令' },
-    },
-    output: {
-      schema: { type: 'json' },
-      render(_args: unknown, value: unknown) {
-        const id = value as string;
-        return [{ type: 'text', text: `✅ 容器已启动\nID: ${id?.substring(0, 12)}` }];
-      },
-    },
-    async execute(args: { image: string; name?: string; detach?: boolean; ports?: string; volumes?: string; env?: string; network?: string; command?: string }) {
-      return runContainer(args.image, {
-        name: args.name,
-        detach: args.detach !== false,
-        ports: args.ports?.split(',').map(s => s.trim()),
-        volumes: args.volumes?.split(',').map(s => s.trim()),
-        env: args.env?.split(',').map(s => s.trim()),
-        network: args.network,
-        command: args.command,
-      });
-    },
-  }), 'dsh-docker: docker_run');
-
-  // docker_stop — 停止容器
-  ctx.effect(() => ctx.tools.register({
-    name: 'docker_stop',
-    description: '停止运行中的 Docker 容器。',
-    parameters: { container: { type: 'string', description: '容器 ID 或名称' }, timeout: { type: 'number', description: '等待停止的超时秒数' } },
-    output: { schema: { type: 'json' }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: `✅ 容器已停止: ${(v as string)?.substring(0, 12)}` }] },
-    async execute(args: { container: string; timeout?: number }) { return stopContainer(args.container, args.timeout); },
-  }), 'dsh-docker: docker_stop');
-
-  // docker_rm — 删除容器
-  ctx.effect(() => ctx.tools.register({
-    name: 'docker_rm',
-    description: '删除 Docker 容器。',
-    parameters: { container: { type: 'string', description: '容器 ID 或名称' }, force: { type: 'boolean', description: '强制删除' } },
-    output: { schema: { type: 'json' }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: `🗑️ 容器已删除: ${(v as string)?.substring(0, 12)}` }] },
-    async execute(args: { container: string; force?: boolean }) { return removeContainer(args.container, args.force); },
-  }), 'dsh-docker: docker_rm');
-
-  // docker_logs — 查看日志
-  ctx.effect(() => ctx.tools.register({
-    name: 'docker_logs',
-    description: '查看 Docker 容器日志。',
-    parameters: {
-      container: { type: 'string', description: '容器 ID 或名称' },
-      tail: { type: 'number', description: '返回最后 N 行（默认 100）' },
-      since: { type: 'string', description: '只显示指定时间后的日志（如 10m, 1h）' },
-    },
-    output: {
-      schema: { type: 'json' },
-      render(_args: unknown, value: unknown) {
-        const log = value as string;
-        const lines = log.split('\n').slice(-50);
-        return [{ type: 'text', text: `## 📋 容器日志 (最近 ${lines.length} 行)\n\`\`\`\n${lines.join('\n')}\n\`\`\`` }];
-      },
-    },
-    async execute(args: { container: string; tail?: number; since?: string }) {
-      return containerLogs(args.container, { tail: args.tail || 100, since: args.since });
-    },
-  }), 'dsh-docker: docker_logs');
-
-  // docker_exec — 在容器中执行命令
-  ctx.effect(() => ctx.tools.register({
-    name: 'docker_exec',
-    description: '在运行中的容器内执行命令。',
-    parameters: { container: { type: 'string', description: '容器 ID 或名称' }, command: { type: 'string', description: '要执行的命令' } },
-    output: {
-      schema: { type: 'json' },
-      render(_args: unknown, value: unknown) {
-        return [{ type: 'text', text: `\`\`\`\n${value}\n\`\`\`` }];
-      },
-    },
-    async execute(args: { container: string; command: string }) { return execInContainer(args.container, args.command); },
-  }), 'dsh-docker: docker_exec');
-
-  // docker_stats — 容器资源统计
-  ctx.effect(() => ctx.tools.register({
-    name: 'docker_stats',
-    description: '获取容器实时资源使用情况（CPU、内存、网络、IO）。',
-    parameters: { container: { type: 'string', description: '容器 ID 或名称' } },
-    output: {
-      schema: { type: 'json' },
-      render(_args: unknown, value: unknown) {
-        const s = value as any;
-        if (s.raw) return [{ type: 'text', text: s.raw }];
-        return [{ type: 'text', text: `## 📊 容器统计\n- CPU: ${s.cpu}\n- 内存: ${s.mem_usage} (${s.mem_perc})\n- 网络: ${s.net_io}\n- 磁盘: ${s.block_io}\n- 进程: ${s.pids}` }];
-      },
-    },
-    async execute(args: { container: string }) { return containerStats(args.container); },
-  }), 'dsh-docker: docker_stats');
-
-  // docker_images — 列出镜像
-  ctx.effect(() => ctx.tools.register({
-    name: 'docker_images',
-    description: '列出本地 Docker 镜像。',
-    output: {
-      schema: { type: 'json' },
-      render(_args: unknown, value: unknown) {
-        const images = value as any[];
-        if (images.length === 0) return [{ type: 'text', text: '📭 没有镜像' }];
-        const lines = [`## 🖼️ Docker 镜像 (${images.length})`];
-        for (const img of images) {
-          lines.push(`- **${img.repo}:${img.tag}** (${img.id?.substring(0, 12)}) — ${img.size} (${img.created})`);
+        key = sep < 0 ? body.slice(0, -1).trim() : body.slice(0, sep).trim()
+        inline = sep < 0 ? '' : body.slice(sep + 1).trim()
+        if (key === '') {
+          errors.push(`line ${row.lineNo}: empty mapping key`)
+          continue
         }
-        return [{ type: 'text', text: lines.join('\n') }];
-      },
-    },
-    async execute() { return listImages(); },
-  }), 'dsh-docker: docker_images');
-
-  // docker_build — 构建镜像
-  ctx.effect(() => ctx.tools.register({
-    name: 'docker_build',
-    description: '从 Dockerfile 构建镜像。',
-    parameters: {
-      context: { type: 'string', description: '构建上下文路径' },
-      tag: { type: 'string', description: '镜像标签（如 myapp:v1.0）' },
-      dockerfile: { type: 'string', description: 'Dockerfile 路径（默认 ./Dockerfile）' },
-      no_cache: { type: 'boolean', description: '不使用缓存' },
-    },
-    output: { schema: { type: 'json' }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: `✅ 镜像构建完成\n\`\`\`\n${(v as string)?.split('\n').slice(-5).join('\n')}\n\`\`\`` }] },
-    async execute(args: { context: string; tag?: string; dockerfile?: string; no_cache?: boolean }) {
-      return buildImage(args.context, { tag: args.tag, dockerfile: args.dockerfile, noCache: args.no_cache });
-    },
-  }), 'dsh-docker: docker_build');
-
-  // docker_compose — Compose 操作
-  ctx.effect(() => ctx.tools.register({
-    name: 'docker_compose',
-    description: 'Docker Compose 操作：up/down/ps/logs。',
-    parameters: {
-      action: { type: 'string', description: '操作：up | down | ps | logs' },
-      path: { type: 'string', description: 'docker-compose.yml 所在目录' },
-      detach: { type: 'boolean', description: 'up 时是否后台运行' },
-      build: { type: 'boolean', description: 'up 时是否重新构建' },
-      tail: { type: 'number', description: 'logs 时返回的行数' },
-    },
-    output: {
-      schema: { type: 'json' },
-      render(_args: unknown, value: unknown) {
-        const result = value;
-        if (typeof result === 'string') return [{ type: 'text', text: result }];
-        if (Array.isArray(result)) {
-          const lines = [`## Compose 服务 (${result.length})`];
-          for (const s of result) {
-            lines.push(`- **${s.name}** — ${s.status}`);
-            if (s.ports) lines.push(`  端口: ${s.ports}`);
+      }
+      let children: CNode[] = []
+      if (i < rows.length && rows[i]!.indent > row.indent) {
+        const childIndent = rows[i]!.indent
+        children = collect(i, childIndent)
+        while (i < rows.length && rows[i]!.indent > row.indent) {
+          if (rows[i]!.indent < childIndent) {
+            errors.push(`line ${rows[i]!.lineNo}: "${rows[i]!.text}" is indented less than its siblings`)
           }
-          return [{ type: 'text', text: lines.join('\n') }];
-        }
-        return [{ type: 'text', text: JSON.stringify(result, null, 2) }];
-      },
-    },
-    async execute(args: { action: string; path: string; detach?: boolean; build?: boolean; tail?: number }) {
-      switch (args.action) {
-        case 'up': return composeUp(args.path, { detach: args.detach !== false, build: args.build });
-        case 'down': return composeDown(args.path);
-        case 'ps': return composePs(args.path);
-        case 'logs': return composeLogs(args.path, { tail: args.tail });
-        default: throw new Error(`未知操作: ${args.action}`);
-      }
-    },
-  }), 'dsh-docker: docker_compose');
-
-  // docker_info — 系统信息
-  ctx.effect(() => ctx.tools.register({
-    name: 'docker_info',
-    description: '获取 Docker 系统信息（版本、存储、容器数等）。',
-    output: {
-      schema: { type: 'json' },
-      render(_args: unknown, value: unknown) {
-        const info = value as any;
-        if (info.raw) return [{ type: 'text', text: info.raw }];
-        return [{ type: 'text', text: `## 🐳 Docker 信息\n- 版本: ${info.server_version}\n- OS: ${info.os}\n- 内核: ${info.kernel}\n- CPU: ${info.cpus} | 内存: ${info.memory}\n- 运行中: ${info.containers_running} | 已停止: ${info.containers_stopped}\n- 镜像数: ${info.images}\n- 存储驱动: ${info.storage_driver}\n- 数据目录: ${info.docker_root}` }];
-      },
-    },
-    async execute() { return dockerInfo(); },
-  }), 'dsh-docker: docker_info');
-
-  // docker_networks — 网络管理
-  ctx.effect(() => ctx.tools.register({
-    name: 'docker_networks',
-    description: '列出 Docker 网络。',
-    output: {
-      schema: { type: 'json' },
-      render(_args: unknown, value: unknown) {
-        const networks = value as any[];
-        if (networks.length === 0) return [{ type: 'text', text: '📭 没有网络' }];
-        const lines = [`## 🌐 Docker 网络 (${networks.length})`];
-        for (const n of networks) lines.push(`- **${n.name}** (${n.driver}) — ${n.scope}`);
-        return [{ type: 'text', text: lines.join('\n') }];
-      },
-    },
-    async execute() { return listNetworks(); },
-  }), 'dsh-docker: docker_networks');
-
-  // docker_volumes — 数据卷管理
-  ctx.effect(() => ctx.tools.register({
-    name: 'docker_volumes',
-    description: '列出 Docker 数据卷。',
-    output: {
-      schema: { type: 'json' },
-      render(_args: unknown, value: unknown) {
-        const volumes = value as any[];
-        if (volumes.length === 0) return [{ type: 'text', text: '📭 没有数据卷' }];
-        const lines = [`## 💾 Docker 数据卷 (${volumes.length})`];
-        for (const v of volumes) lines.push(`- **${v.name}** (${v.driver})`);
-        return [{ type: 'text', text: lines.join('\n') }];
-      },
-    },
-    async execute() { return listVolumes(); },
-  }), 'dsh-docker: docker_volumes');
-
-  // slash 命令 /docker
-  ctx.effect(() => ctx.commands.register({
-    name: 'docker',
-    description: 'Docker 管理',
-    input: { hint: 'ps | images | info | <container> logs | <container> exec <cmd>' },
-    async handler(invocation: any) {
-      const parts = invocation.rawInput.trim().split(/\s+/).filter(Boolean);
-      if (parts.length === 0) return { kind: 'text', text: '用法: /docker ps | images | info | <container> logs' };
-      const cmd = parts[0];
-      switch (cmd) {
-        case 'ps': { const c = listContainers(); return { kind: 'text', text: `${c.length} 个容器` }; }
-        case 'images': { const i = listImages(); return { kind: 'text', text: `${i.length} 个镜像` }; }
-        case 'info': { const info = dockerInfo(); return { kind: 'text', text: `Docker ${info.server_version} | ${info.containers_running} 运行中` }; }
-        default: {
-          if (parts[1] === 'logs') return { kind: 'text', text: containerLogs(cmd, { tail: 50 }) };
-          if (parts[1] === 'exec') return { kind: 'text', text: execInContainer(cmd, parts.slice(2).join(' ')) };
-          return { kind: 'text', text: `未知子命令: ${parts[1]}` };
+          i++
         }
       }
-    },
-  }), 'dsh-docker: command');
+      nodes.push({ key, inline, lineNo: row.lineNo, children })
+    }
+    return nodes
+  }
 
-  // 设置注册
-  ctx.inject(['settings'], (sctx: any) => {
-    const { settingsNamespace } = require('@deepseek-ai/dsh-settings');
-    sctx.settings.register(settingsNamespace('docker'), configSchema, { base: config, expose: true, applies: 'live' });
-  });
+  return { nodes: collect(0, rows[0]!.indent), errors }
+}
+
+function childOf(node: CNode, key: string): CNode | undefined {
+  return node.children.find((child) => child.key === key)
+}
+
+function unquote(text: string): string {
+  return text.replace(/^\[?\s*["']|["']\s*\]?$/g, '').trim()
+}
+
+/** Raw `-` item texts of a node, falling back to a flow `[a, b]` inline value. */
+function itemTexts(node: CNode): string[] {
+  const items = node.children.filter((child) => child.key === '').map((child) => unquote(child.inline))
+  if (items.length === 0 && node.inline.startsWith('[')) {
+    const inner = node.inline.slice(1, node.inline.endsWith(']') ? -1 : undefined)
+    for (const part of inner.split(',')) {
+      if (part.trim() !== '') items.push(unquote(part))
+    }
+  }
+  return items.filter((item) => item !== '')
+}
+
+/** Names a `depends_on:` / `networks:` node refers to (block or flow style). */
+function referencedNames(node: CNode): string[] {
+  const names = node.children.map((child) => (child.key === '' ? child.inline : child.key))
+  if (names.length === 0) names.push(...itemTexts(node))
+  return names.map(unquote).filter((name) => name !== '')
+}
+
+const PORT_RANGE = /^\d{1,5}(-\d{1,5})?$/
+const LONG_SYNTAX = /^[A-Za-z_][\w-]*:\s/
+const COMPOSE_ROOT_KEYS = ['services', 'networks', 'volumes', 'configs', 'secrets', 'name']
+/** Lines `docker_logs` requests when the caller passes tail 0. */
+const DEFAULT_TAIL = 100
+
+/** Validate one short-syntax `ports:` entry; returns a problem or undefined. */
+function portProblem(entry: string): string | undefined {
+  let text = entry.replace(/^\[|\]$/g, '')
+  const protocol = text.match(/\/(tcp|udp|sctp)$/)
+  if (protocol) text = text.slice(0, -protocol[0].length)
+  const parts = text.split(':')
+  const numeric = (value: string) => /^\d[\d-]*$/.test(value)
+  const usable = (value: string) => PORT_RANGE.test(value) && value.split('-').every((part) => Number(part) >= 1 && Number(part) <= 65535)
+  if (parts.length === 1) {
+    return numeric(parts[0]!) && usable(parts[0]!) ? undefined : `port "${entry}" is not a number or a range inside 1-65535`
+  }
+  const container = parts[parts.length - 1]!
+  if (!usable(container)) return `port mapping "${entry}" has an unusable container side "${container}"`
+  const host = parts.length === 3 ? parts[1]! : parts[0]!
+  if (numeric(host) && !usable(host)) return `port mapping "${entry}" has an unusable host side "${host}"`
+  return undefined
+}
+
+/**
+ * Run the structural Compose rules over a document, with no filesystem,
+ * subprocess, or network access.
+ * @param text - compose YAML text.
+ * @returns service names found, blocking errors, and non-blocking warnings.
+ */
+function inspectCompose(text: string): { services: string[]; errors: string[]; warnings: string[] } {
+  const warnings: string[] = []
+  if (text.trim() === '') return { services: [], errors: ['the compose document is empty: pass the full YAML text'], warnings }
+  const { nodes, errors: syntaxErrors } = readCompose(text)
+  const errors = [...syntaxErrors]
+  if (errors.length > 0) return { services: [], errors, warnings }
+
+  const top = new Map<string, CNode>()
+  for (const node of nodes) {
+    if (top.has(node.key)) errors.push(`line ${node.lineNo}: duplicate top-level key "${node.key}"`)
+    else top.set(node.key, node)
+    if (node.key === 'version') warnings.push('top-level "version" is obsolete in Compose v2 and ignored; consider removing it')
+    else if (!COMPOSE_ROOT_KEYS.includes(node.key) && !node.key.startsWith('x-')) {
+      warnings.push(`top-level key "${node.key}" is not a Compose section and will be ignored`)
+    }
+  }
+
+  const servicesNode = top.get('services')
+  if (!servicesNode) {
+    errors.push('missing top-level "services" section — a Compose file must declare at least one service')
+    return { services: [], errors, warnings }
+  }
+  const services = servicesNode.children.map((node) => node.key).filter((key) => key !== '')
+  if (services.length === 0) errors.push('"services" is declared but empty — add at least one service')
+
+  const networkNames = new Set((top.get('networks')?.children ?? []).map((node) => node.key))
+
+  for (const service of servicesNode.children) {
+    if (service.children.length === 0 && service.inline === '') {
+      errors.push(`service "${service.key}" (line ${service.lineNo}) has no configuration`)
+      continue
+    }
+    if (!childOf(service, 'image') && !childOf(service, 'build')) {
+      errors.push(`service "${service.key}": needs "image" or "build" so the container has something to run`)
+    }
+    if (childOf(service, 'links')) warnings.push(`service "${service.key}": "links" is legacy; rely on "depends_on" and the network for DNS`)
+    if (childOf(service, 'container_name') && services.length > 1) {
+      warnings.push(`service "${service.key}": sets "container_name", so it cannot be scaled with --scale`)
+    }
+
+    const ports = childOf(service, 'ports')
+    if (ports) {
+      for (const entry of itemTexts(ports)) {
+        if (entry === '' || LONG_SYNTAX.test(entry)) continue // long syntax (published:/target:) is not short-form checked
+        const problem = portProblem(entry)
+        if (problem) warnings.push(`service "${service.key}": ${problem}`)
+      }
+    }
+
+    const depends = childOf(service, 'depends_on')
+    if (depends) {
+      for (const ref of referencedNames(depends)) {
+        if (ref.includes(':') || ref.includes('=')) continue
+        if (!services.includes(ref)) errors.push(`service "${service.key}": depends_on references unknown service "${ref}"`)
+      }
+    }
+
+    const networks = childOf(service, 'networks')
+    if (networks && !childOf(service, 'network_mode') && networkNames.size > 0) {
+      for (const ref of referencedNames(networks)) {
+        if (ref.includes(':')) continue
+        if (!networkNames.has(ref)) warnings.push(`service "${service.key}": network "${ref}" is not declared in the top-level "networks" section`)
+      }
+    }
+  }
+
+  return { services, errors, warnings }
+}
+
+// ---------------------------------------------------------------------------
+// Result rendering
+// ---------------------------------------------------------------------------
+
+interface PsValue {
+  ok: boolean
+  command: string
+  exitCode: number
+  containers: { id: string; name: string; image: string; state: string; status: string }[]
+  message: string
+}
+
+interface LogsValue {
+  ok: boolean
+  command: string
+  exitCode: number
+  lines: string[]
+  truncated: boolean
+  errorLines: number
+  message: string
+}
+
+interface ComposeValue {
+  ok: boolean
+  command: string
+  external: boolean
+  exitCode: number
+  services: string[]
+  errors: string[]
+  warnings: string[]
+  message: string
+}
+
+function renderPs(value: PsValue): string {
+  if (!value.ok) return `docker ps failed: ${value.message}\n$ ${value.command}`
+  if (value.containers.length === 0) return `No containers matched.\n$ ${value.command}`
+  const rows = value.containers.map((row) => `  ${row.id.slice(0, 12).padEnd(13)} ${row.name.padEnd(24)} ${row.image.padEnd(26)} ${row.state.padEnd(10)} ${row.status}`)
+  return `${value.containers.length} container(s)\n$ ${value.command}\n${rows.join('\n')}`
+}
+
+function renderLogs(value: LogsValue): string {
+  if (!value.ok) return `docker logs failed: ${value.message}\n$ ${value.command}`
+  const flags = [
+    value.truncated ? 'truncated to the configured cap' : '',
+    value.errorLines > 0 ? `${value.errorLines} error-like line(s)` : '',
+  ].filter((text) => text !== '')
+  const head = `${value.lines.length} line(s)${flags.length > 0 ? ` — ${flags.join(', ')}` : ''}`
+  return [head, `$ ${value.command}`, ...value.lines.map((line) => `  ${line}`)].join('\n')
+}
+
+function renderCompose(value: ComposeValue): string {
+  const head = value.ok
+    ? `Compose file is valid (${value.services.length} service(s): ${value.services.join(', ') || 'none'}).`
+    : `Compose file has ${value.errors.length} blocking problem(s).`
+  const body = [
+    ...value.errors.map((line) => `- error: ${line}`),
+    ...value.warnings.map((line) => `- warning: ${line}`),
+  ]
+  const tail = value.external ? `$ ${value.command}` : '(local structural check only; set externalCheck to also ask the docker CLI)'
+  return [head, ...body, tail].join('\n')
+}
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
+/**
+ * Register the Docker tools on `ctx.tools`.
+ * @param ctx - registrant context carrying the tool registry.
+ * @param config - deployment's docker executable, budgets, and command seam.
+ */
+export function apply(ctx: Context, config: Config): void {
+  const run: RunCommand = config.runCommand ?? defaultRunCommand
+
+  ctx.tools.register(defineTool({
+    name: 'docker_ps',
+    description:
+      'List Docker containers by running `docker ps --format json` and returning ' +
+      'structured rows (id, name, image, state, status). Pass all=true to include ' +
+      'stopped containers and all=false for running ones only; pass name to keep ' +
+      'only containers whose name contains that substring, or an empty string for ' +
+      'everything. The result echoes the exact command that ran, so you can ' +
+      're-check it by hand.',
+    parameters: {
+      all: { type: 'boolean', required: true, description: 'Include stopped containers (adds --all); false lists running containers only.' },
+      name: { type: 'string', required: true, description: 'Name substring filter (docker ps --filter name=<value>). Pass an empty string to keep every container.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true, description: 'Whether the command ran and its output parsed.' },
+          command: { type: 'string', required: true, description: 'The docker command that was executed.' },
+          exitCode: { type: 'integer', required: true, description: 'Process exit code; -1 when the executable could not start.' },
+          containers: {
+            type: 'array',
+            required: true,
+            description: 'One row per container; empty when nothing matched or the call failed.',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                id: { type: 'string', required: true, description: 'Full container id (--no-trunc).' },
+                name: { type: 'string', required: true, description: 'Container name(s), comma separated when several.' },
+                image: { type: 'string', required: true, description: 'Image the container was created from.' },
+                state: { type: 'string', required: true, description: 'running | exited | created | restarting | paused | dead.' },
+                status: { type: 'string', required: true, description: 'Docker status line, e.g. "Up 3 hours".' },
+              },
+            },
+          },
+          message: { type: 'string', required: true, description: 'Failure detail; empty on success.' },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: renderPs(value) }],
+    },
+    isConcurrencySafe: () => true,
+    async execute(args) {
+      const filter = (args.name ?? '').trim()
+      if (filter) {
+        const problem = tokenProblem(filter, 'name')
+        if (problem) return { ok: false, command: '', exitCode: -1, containers: [], message: problem }
+      }
+      const argv = [config.dockerPath, 'ps', '--no-trunc', '--format', 'json']
+      if (args.all) argv.push('--all')
+      if (filter) argv.push('--filter', `name=${filter}`)
+      const result = await run(argv, config.timeoutMs)
+      const command = formatArgv(argv)
+      if (result.exitCode !== 0) {
+        return {
+          ok: false,
+          command,
+          exitCode: result.exitCode,
+          containers: [],
+          message: firstLine(result.stderr) || firstLine(result.stdout) || `docker ps exited with code ${result.exitCode}`,
+        }
+      }
+      const { rows, parsed } = parseJsonRows(result.stdout)
+      if (!parsed) {
+        return { ok: false, command, exitCode: result.exitCode, containers: [], message: `could not parse docker ps output: ${firstLine(result.stdout)}` }
+      }
+      const containers = rows.map((row) => ({
+        id: field(row, 'ID'),
+        name: field(row, 'Names'),
+        image: field(row, 'Image'),
+        state: field(row, 'State'),
+        status: field(row, 'Status'),
+      }))
+      return { ok: true, command, exitCode: result.exitCode, containers, message: '' }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'docker_logs',
+    description:
+      'Fetch the log tail of one container with `docker logs` and return the lines. ' +
+      'container takes a name or id; tail is how many recent lines to request (0 ' +
+      'means the default 100, and any value is capped by this plugin\'s ' +
+      'maxLogLines); since is a lower bound such as "10m" or an RFC3339 timestamp ' +
+      '(empty string for none); grep keeps only lines containing that substring, ' +
+      'case-insensitively (empty string for all). Container stdout and stderr are ' +
+      'both returned, stdout first, and the result counts error-looking lines.',
+    parameters: {
+      container: { type: 'string', required: true, description: 'Container name or id, e.g. "api-1".' },
+      tail: { type: 'number', required: true, description: 'How many recent lines to request; 0 means the plugin default (100). Values above the configured cap are clamped to it.' },
+      since: { type: 'string', required: true, description: 'Lower bound: relative duration ("10m", "1h30m") or an RFC3339 timestamp. Pass an empty string for no bound.' },
+      grep: { type: 'string', required: true, description: 'Case-insensitive substring filter applied to the returned lines. Pass an empty string to keep everything.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true, description: 'Whether `docker logs` succeeded.' },
+          command: { type: 'string', required: true, description: 'The docker command that was executed.' },
+          exitCode: { type: 'integer', required: true, description: 'Process exit code; -1 when the executable could not start.' },
+          lines: {
+            type: 'array',
+            required: true,
+            description: 'Log lines after filtering and the configured cap; empty on failure.',
+            items: { type: 'string' },
+          },
+          truncated: { type: 'boolean', required: true, description: 'Whether lines were dropped to respect the configured cap.' },
+          errorLines: { type: 'integer', required: true, description: 'Returned lines matching error/fatal/panic/exception/traceback/failed.' },
+          message: { type: 'string', required: true, description: 'Failure detail; empty on success.' },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: renderLogs(value) }],
+    },
+    isConcurrencySafe: () => true,
+    async execute(args) {
+      const container = args.container.trim()
+      const since = (args.since ?? '').trim()
+      const grep = (args.grep ?? '').trim().toLowerCase()
+      const problems: string[] = []
+      const containerProblem = tokenProblem(container, 'container')
+      if (containerProblem) problems.push(containerProblem)
+      if (since && tokenProblem(since, 'since')) problems.push('since: must be one token such as "10m" or "2024-01-02T03:04:05Z"')
+      if (problems.length > 0) {
+        return { ok: false, command: '', exitCode: -1, lines: [], truncated: false, errorLines: 0, message: problems.join('; ') }
+      }
+
+      const cap = Math.max(1, Math.floor(config.maxLogLines))
+      const requested = typeof args.tail === 'number' && Number.isFinite(args.tail) ? Math.floor(args.tail) : 0
+      const tail = Math.min(Math.max(1, requested || DEFAULT_TAIL), cap)
+      const argv = [config.dockerPath, 'logs', '--tail', String(tail)]
+      if (since) argv.push('--since', since)
+      argv.push(container)
+
+      const result = await run(argv, config.timeoutMs)
+      const command = formatArgv(argv)
+      if (result.exitCode !== 0) {
+        return {
+          ok: false,
+          command,
+          exitCode: result.exitCode,
+          lines: [],
+          truncated: false,
+          errorLines: 0,
+          message: firstLine(result.stderr) || firstLine(result.stdout) || `docker logs exited with code ${result.exitCode}`,
+        }
+      }
+      const merged = [...toLines(result.stdout), ...toLines(result.stderr)]
+      const capped = merged.length > cap
+      let lines = capped ? merged.slice(merged.length - cap) : merged
+      if (grep !== '') lines = lines.filter((line) => line.toLowerCase().includes(grep))
+      const errorLines = lines.filter((line) => /error|fatal|panic|exception|traceback|failed/i.test(line)).length
+      return { ok: true, command, exitCode: result.exitCode, lines, truncated: capped, errorLines, message: '' }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'docker_compose_config',
+    description:
+      'Validate a Docker Compose file. Pass the complete YAML text as content for an ' +
+      'instant offline structural check (missing services section, a service with ' +
+      'neither image nor build, depends_on naming an unknown service, malformed ' +
+      'ports, obsolete version key, undeclared networks). Pass an empty content to ' +
+      'have the plugin read the file at path instead. Set externalCheck=true to also ' +
+      'run `docker compose -f <path> config --quiet`, which validates the merged, ' +
+      'environment-interpolated result and is authoritative.',
+    parameters: {
+      path: { type: 'string', required: true, description: 'Compose file path, e.g. "compose.yml" or "deploy/docker-compose.yml".' },
+      content: { type: 'string', required: true, description: 'Full compose YAML text; an empty string means "read the file at path".' },
+      externalCheck: { type: 'boolean', required: true, description: 'Also validate through the docker CLI.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true, description: 'Whether the file passed every check that ran.' },
+          command: { type: 'string', required: true, description: 'The docker compose command that ran, or would run with externalCheck.' },
+          external: { type: 'boolean', required: true, description: 'Whether the docker CLI was consulted.' },
+          exitCode: { type: 'integer', required: true, description: 'Exit code of that command; -1 when it did not run.' },
+          services: { type: 'array', required: true, description: 'Service names declared in the file.', items: { type: 'string' } },
+          errors: { type: 'array', required: true, description: 'Blocking problems, local checks first then the CLI; empty when ok.', items: { type: 'string' } },
+          warnings: { type: 'array', required: true, description: 'Advisories that do not block `docker compose up`.', items: { type: 'string' } },
+          message: { type: 'string', required: true, description: 'One-line summary of what was checked.' },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: renderCompose(value) }],
+    },
+    isConcurrencySafe: () => true,
+    async execute(args) {
+      const composePath = args.path.trim()
+      const pathIssue = pathProblem(composePath, 'path')
+      if (pathIssue) {
+        return { ok: false, command: '', external: false, exitCode: -1, services: [], errors: [pathIssue], warnings: [], message: 'nothing was checked' }
+      }
+
+      const argv = [config.dockerPath, 'compose', '-f', composePath, 'config', '--quiet']
+      const command = formatArgv(argv)
+
+      let text = args.content ?? ''
+      if (text === '') {
+        try {
+          const { readFileSync } = await import('node:fs')
+          text = readFileSync(composePath, 'utf8')
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error)
+          return { ok: false, command, external: false, exitCode: -1, services: [], errors: [`cannot read "${composePath}": ${reason}`], warnings: [], message: 'the file could not be read' }
+        }
+      }
+
+      const report = inspectCompose(text)
+      const errors = [...report.errors]
+      const warnings = [...report.warnings]
+      let external = false
+      let exitCode = -1
+
+      if (args.externalCheck) {
+        external = true
+        const result = await run(argv, config.timeoutMs)
+        exitCode = result.exitCode
+        if (result.exitCode !== 0) {
+          const detail = firstLine(result.stderr) || firstLine(result.stdout) || `docker compose config exited with code ${result.exitCode}`
+          errors.push(`docker compose config: ${detail}`)
+        }
+      }
+
+      const ok = errors.length === 0
+      const summary = external
+        ? ok ? 'local checks and the docker CLI both passed' : 'see errors'
+        : ok ? 'local structural check passed; the docker CLI was not consulted' : 'see errors'
+      return { ok, command, external, exitCode, services: report.services, errors, warnings, message: summary }
+    },
+  }))
 }

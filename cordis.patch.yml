@@ -1,5 +1,12 @@
+# dsh-docker bundle layer: inserts the host tool plugin into a profile's
+# layer stack. Install with:
+#   npx -y @deepseek-ai/dsh plugin --profile web add @qingshanjiluo/dsh-docker
+# `runCommand` is intentionally absent: it is an injectable seam whose default
+# (spawnSync over node:child_process) is supplied by the plugin's own schema.
 - insert:
     - id: docker
-      name: dsh-docker
+      name: '@qingshanjiluo/dsh-docker'
       config:
-        enabled: true
+        dockerPath: docker
+        defaultTimeout: 30000
+        maxLogLines: 500
